@@ -1,7 +1,14 @@
 [Unit]
-Description=Internet Blocker - Monitor kids screen time
+Description=Internet Blocker - Kids screen time enforcer
+After=network-online.target
+Wants=network-online.target
 
 [Service]
-Type=oneshot
+Type=simple
 WorkingDirectory=/home/morgan/src/internet-blocker-for-kids
 ExecStart=/home/morgan/.local/bin/uv run internet_blocker.py
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target

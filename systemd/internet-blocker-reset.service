@@ -1,7 +1,0 @@
-[Unit]
-Description=Internet Blocker - Midnight reset
-
-[Service]
-Type=oneshot
-WorkingDirectory=/home/morgan/src/internet-blocker-for-kids
-ExecStart=/home/morgan/.local/bin/uv run internet_blocker.py --reset

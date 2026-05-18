@@ -1,14 +1,14 @@
 # Internet Blocker for Kids
 
 Enforces a daily 1-hour screen time limit for specific devices on a UniFi UDM Pro network.
-Polls the UniFi API every 5 minutes, tracks active usage in a local JSON file, and blocks devices when they hit the limit. Resets automatically at midnight.
+Runs as a daemon, polling the UniFi API every 5 minutes. Resets automatically at midnight.
 
 ## How it works
 
 - Only counts a device as "active" if its download rate exceeds `ACTIVE_RATE_THRESHOLD_BYTES_PER_SEC` (default: 6250 bytes/s = 50 Kbps). Idle background traffic doesn't burn the quota.
 - State is stored in `data/state.json`.
-- Two systemd timers: one fires every 5 minutes (monitor), one fires at midnight (reset).
-- If the machine is off at midnight, `Persistent=true` ensures the reset fires on next boot.
+- Midnight reset is automatic — the daemon detects the date change and unblocks all devices.
+- If the machine was off at midnight, the reset fires on next startup.
 
 ## Local Setup
 
@@ -24,42 +24,33 @@ Polls the UniFi API every 5 minutes, tracks active usage in a local JSON file, a
    ```
 
 3. **Configure:**
-   - Copy `.env.example` to `.env` and fill in your UDM Pro IP and API key.
-   - Edit `KIDS` in `internet_blocker.py` with your kids' names and real MAC addresses.
+   Copy `.env.example` to `.env` and fill in your values. See `.env.example` for the full format.
 
 ## Server Setup
 
-1. **Symlink systemd files:**
+1. **Symlink systemd file:**
    ```
    ln -s ~/src/internet-blocker-for-kids/systemd/internet-blocker.service ~/.config/systemd/user/
-   ln -s ~/src/internet-blocker-for-kids/systemd/internet-blocker.timer ~/.config/systemd/user/
-   ln -s ~/src/internet-blocker-for-kids/systemd/internet-blocker-reset.service ~/.config/systemd/user/
-   ln -s ~/src/internet-blocker-for-kids/systemd/internet-blocker-reset.timer ~/.config/systemd/user/
    ```
 
 2. **Enable and start:**
    ```
    systemctl --user daemon-reload
-   systemctl --user enable --now internet-blocker.timer
-   systemctl --user enable --now internet-blocker-reset.timer
+   systemctl --user enable --now internet-blocker.service
    sudo loginctl enable-linger $USER
    ```
 
 ## Monitoring
 
-```
-# View active timers
-systemctl --user list-timers
-
-# Tail logs
+```bash
+# Tail live logs
 journalctl --user -u internet-blocker.service -f
-journalctl --user -u internet-blocker-reset.service -f
 
-# Manual run (monitor)
-systemctl --user start internet-blocker.service
+# Manual reset (unblock all, zero counters)
+uv run internet_blocker.py --reset
 
-# Manual reset
-systemctl --user start internet-blocker-reset.service
+# Restart the daemon
+systemctl --user restart internet-blocker.service
 ```
 
 ## Tuning
@@ -67,5 +58,5 @@ systemctl --user start internet-blocker-reset.service
 | Variable | Default | Description |
 |---|---|---|
 | `DAILY_LIMIT_MINUTES` | 60 | Daily screen time quota per device |
-| `POLL_INTERVAL_MINUTES` | 5 | Must match the timer interval |
+| `POLL_INTERVAL_SECONDS` | 300 | How often to check (5 minutes) |
 | `ACTIVE_RATE_THRESHOLD_BYTES_PER_SEC` | 6250 | 50 Kbps — raise if idle sync triggers false counts |
