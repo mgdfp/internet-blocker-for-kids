@@ -1,0 +1,7 @@
+[Unit]
+Description=Internet Blocker - Monitor kids screen time
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/morgan/src/internet-blocker-for-kids
+ExecStart=/home/morgan/.local/bin/uv run internet_blocker.py
