@@ -466,12 +466,20 @@ def handle_telegram_command(text: str, clients: dict) -> None:
             lines = []
             if clients:
                 dynamic_names = load_dynamic_clients().keys()
+                state = _load_state_raw()
                 lines.append("📋 Kjente klienter:\n")
                 for name, cfg in clients.items():
                     limit_str = f"{cfg['limit_seconds'] // 60}min" if cfg["limit_seconds"] else "ubegrenset"
                     source = "(lagt til)" if name in dynamic_names else "(.env)"
                     phone_str = cfg["phone"] if cfg.get("phone") else "ingen SMS"
-                    lines.append(f"• {name} — {cfg['mac']} — {limit_str} — {phone_str} {source}")
+                    person = state.get(name, {})
+                    used_min = person.get("seconds", 0) // 60
+                    throttled = person.get("throttled", False)
+                    if cfg["limit_seconds"]:
+                        status = f"🚫 {used_min}min brukt" if throttled else f"{used_min}/{cfg['limit_seconds'] // 60}min"
+                    else:
+                        status = f"{used_min}min brukt (ubegrenset)"
+                    lines.append(f"• {name} — {status} — {phone_str} {source}")
             if STATE_FILE.exists():
                 try:
                     with open(STATE_FILE) as f:
