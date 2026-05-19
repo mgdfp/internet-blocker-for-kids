@@ -1,0 +1,18 @@
+{
+  "half_quota": [
+    "Hei {name}! Du har allerede sløst bort {used} minutter på doomscrolling i dag 😬 Du har {remaining} minutter igjen. Utenfor vinduet ditt finnes det en verden uten algoritmer — vi anbefaler den varmt.",
+    "Halvtiden! {name} har brukt opp halvparten av dagens kvote ({used}/{limit} min). På {used} minutter kunne du ha lært å lage pannekaker, gått en tur, eller tatt en lur. Bare si'e.",
+    "⚠️ Kvotevarsel! {name}, {used} minutter er borte for alltid. Du har {remaining} igjen. TikTok vil klare seg fint uten deg en liten stund, det lover vi.",
+    "Hei {name}! Visste du at på {used} minutter kan du gå nesten 3 km? Du har {remaining} minutter igjen av internett-kvoten. Kanskje bruk dem med omhu? 🚶",
+    "HALVVEIS! {name} har surfa seg gjennom {used} minutter i dag. {remaining} minutter gjenstår. Pro-tips: prøv å se ut av et vindu i {remaining} minutter og se hva som skjer.",
+    "Internett-politiet melder: {name} har brukt {used} av {limit} minutter. Resterende kvote: {remaining} min. Anbefalt aktivitet: alt som ikke involverer en skjerm 📵"
+  ],
+  "throttled": [
+    "GAME OVER, {name}! Du har sløst bort alle {limit} minuttene dine på internett i dag 🐌 Hastigheten er nå redusert til sneglefart frem til midnatt. Kanskje finn frem en bok?",
+    "Offisiell melding til {name}: daglig internett-kvote ({limit} min) er oppbrukt. Nettet ditt går nå på lavgir frem til midnatt. Men hei — sola skinner der ute! ☀️",
+    "Bom, {name}! {limit} minutter med doomscrolling er nok for én dag. Internett er nå i sparebluss frem til klokken 00:00. Folk overlevde uten internett i tusenvis av år — du klarer noen timer! 💪",
+    "KVOTEN ER BRUKT! {name} har forbrukt sine {limit} minutter. Nettet er satt til minimum. På den lyse siden: nå kan du endelig lese den boken som har støvet ned siden jul. 📚",
+    "Piiiip! {name} har brukt opp kvoten på {limit} minutter. Internett er nå tregere enn et 56k-modem. Husk: verden utenfor telefonen er faktisk ganske bra! Reset skjer ved midnatt 🌙",
+    "Tid er ute, {name}! {limit} minutter med scrolling er nok. Internett snegles ned frem til midnatt. Anbefalt erstatning: gå ut, spis noe, snakk med et menneske IRL 🌿"
+  ]
+}

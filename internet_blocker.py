@@ -3,6 +3,7 @@ import argparse
 import json
 import logging
 import os
+import random
 import sys
 import time
 from datetime import date
@@ -27,11 +28,17 @@ VLAN_ID = int(os.getenv("VLAN_ID", "0")) or None
 # and reading the "usergroup_id" field after applying the profile in the UI.
 THROTTLE_PROFILE_ID = os.getenv("THROTTLE_PROFILE_ID", "")
 
+# Twilio credentials for SMS notifications.
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
+TWILIO_FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER", "")
+
 # Minimum rx_rate in bytes/sec to count as active use (default: 50 Kbps = 6250 bytes/sec).
 # Increase this if idle background sync is triggering false counts.
 ACTIVE_RATE_THRESHOLD_BYTES_PER_SEC = 6_250
 
 STATE_FILE = Path(__file__).parent / "data" / "state.json"
+MESSAGES_FILE = Path(__file__).parent / "messages.json"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,17 +51,19 @@ log = logging.getLogger(__name__)
 def load_clients() -> dict[str, dict]:
     """
     Parse CLIENT* entries from .env. Format per line:
-        CLIENT1=name,mac,60min
+        CLIENT1=name,mac,60min,+4712345678
         CLIENT2=name,mac,unlimited
+    Phone number is optional — omit for clients who should not receive SMS.
     """
     clients = {}
     for key in sorted(k for k in os.environ if k.startswith("CLIENT")):
         raw = os.environ[key]
         parts = [p.strip() for p in raw.split(",")]
-        if len(parts) != 3:
-            log.warning("Skipping malformed %s (expected name,mac,limit): %s", key, raw)
+        if len(parts) not in (3, 4):
+            log.warning("Skipping malformed %s (expected name,mac,limit[,phone]): %s", key, raw)
             continue
-        name, mac, quota = parts
+        name, mac, quota = parts[0], parts[1], parts[2]
+        phone = parts[3] if len(parts) == 4 else None
         if quota.lower() == "unlimited":
             limit_seconds = None
         else:
@@ -63,8 +72,17 @@ def load_clients() -> dict[str, dict]:
             except ValueError:
                 log.warning("Skipping %s — invalid limit %r (use e.g. 60min or unlimited)", key, quota)
                 continue
-        clients[name] = {"mac": mac.lower(), "limit_seconds": limit_seconds}
+        clients[name] = {"mac": mac.lower(), "limit_seconds": limit_seconds, "phone": phone}
     return clients
+
+
+def load_messages() -> dict:
+    try:
+        with open(MESSAGES_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        log.warning("Could not load messages.json: %s — SMS notifications will use fallback text.", e)
+        return {}
 
 
 def _headers() -> dict:
@@ -86,7 +104,7 @@ def load_state(clients: dict) -> dict:
             return state
         except (json.JSONDecodeError, OSError):
             log.warning("State file corrupt or unreadable — starting fresh.")
-    return {name: {"seconds": 0, "throttled": False} for name in clients}
+    return {name: {"seconds": 0, "throttled": False, "notified_half": False} for name in clients}
 
 
 def save_state(state: dict) -> None:
@@ -152,25 +170,43 @@ def unthrottle_client(mac: str) -> bool:
     return _update_user(mac, {"usergroup_id": ""})
 
 
-def notify(name: str, seconds_used: int, limit_seconds: int) -> None:
-    """Hook for future notifications (e.g. WhatsApp via Twilio or similar)."""
-    pass
+def send_sms(to_number: str, body: str) -> None:
+    if not all([to_number, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER]):
+        return
+    try:
+        resp = requests.post(
+            f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Messages.json",
+            auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
+            data={"From": TWILIO_FROM_NUMBER, "To": to_number, "Body": body},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        log.info("SMS sent to %s.", to_number)
+    except requests.RequestException as e:
+        log.error("Failed to send SMS to %s: %s", to_number, e)
+
+
+def _pick_message(messages: dict, event: str, **kwargs) -> str:
+    options = messages.get(event, [])
+    if not options:
+        return ""
+    return random.choice(options).format(**kwargs)
 
 
 def run_reset(clients: dict) -> None:
     log.info("Running daily reset — unblocking and removing rate limits for all clients.")
     for name, cfg in clients.items():
         mac = cfg["mac"]
-        _stamgr("unblock-sta", mac)  # clears any hard block from previous script versions
+        _stamgr("unblock-sta", mac)
         if unthrottle_client(mac):
             log.info("Unthrottled %s (%s).", name, mac)
-    fresh = {name: {"seconds": 0, "throttled": False} for name in clients}
+    fresh = {name: {"seconds": 0, "throttled": False, "notified_half": False} for name in clients}
     fresh["last_reset_date"] = date.today().isoformat()
     save_state(fresh)
     log.info("Reset complete.")
 
 
-def run_monitor(clients: dict) -> None:
+def run_monitor(clients: dict, messages: dict) -> None:
     state = load_state(clients)
     active_network_clients = fetch_active_clients()
 
@@ -184,7 +220,8 @@ def run_monitor(clients: dict) -> None:
     for name, cfg in clients.items():
         mac = cfg["mac"]
         limit_seconds = cfg["limit_seconds"]
-        person = state.setdefault(name, {"seconds": 0, "throttled": False})
+        phone = cfg["phone"]
+        person = state.setdefault(name, {"seconds": 0, "throttled": False, "notified_half": False})
 
         if person["throttled"]:
             log.info("%s already throttled, skipping.", name)
@@ -205,14 +242,33 @@ def run_monitor(clients: dict) -> None:
 
         if limit_seconds is None:
             log.info("%s active — %dm used (unlimited).", name, minutes_used)
-        else:
-            limit_minutes = limit_seconds // 60
-            log.info("%s active — %dm/%dm used.", name, minutes_used, limit_minutes)
-            notify(name, person["seconds"], limit_seconds)
-            if person["seconds"] >= limit_seconds:
-                log.info("Limit reached — applying throttle profile to %s.", name)
-                if throttle_client(mac):
-                    person["throttled"] = True
+            continue
+
+        limit_minutes = limit_seconds // 60
+        log.info("%s active — %dm/%dm used.", name, minutes_used, limit_minutes)
+
+        # 50% notification
+        if not person.get("notified_half") and person["seconds"] >= limit_seconds // 2:
+            remaining = (limit_seconds - person["seconds"]) // 60
+            msg = _pick_message(messages, "half_quota",
+                                name=name.capitalize(), used=minutes_used,
+                                remaining=remaining, limit=limit_minutes)
+            if msg:
+                send_sms(phone, msg)
+                log.info("50%% notification sent to %s.", name)
+            person["notified_half"] = True
+
+        # Throttle
+        if person["seconds"] >= limit_seconds:
+            log.info("Limit reached — applying throttle profile to %s.", name)
+            if throttle_client(mac):
+                person["throttled"] = True
+                msg = _pick_message(messages, "throttled",
+                                    name=name.capitalize(), used=minutes_used,
+                                    limit=limit_minutes)
+                if msg:
+                    send_sms(phone, msg)
+                    log.info("Throttle notification sent to %s.", name)
 
     save_state(state)
 
@@ -251,10 +307,13 @@ def main() -> None:
             print(json.dumps(user, indent=2))
         return
 
+    messages = load_messages()
+
     log.info("Starting internet blocker.")
     for name, cfg in clients.items():
         limit_str = f"{cfg['limit_seconds'] // 60}min" if cfg["limit_seconds"] else "unlimited"
-        log.info("  %s — %s — limit: %s", name, cfg["mac"], limit_str)
+        sms_str = cfg["phone"] if cfg["phone"] else "no SMS"
+        log.info("  %s — %s — limit: %s — %s", name, cfg["mac"], limit_str, sms_str)
     vlan_str = f"VLAN{VLAN_ID}" if VLAN_ID else "all VLANs"
     log.info("Polling %s every %ds | Throttle profile: %s | Active threshold: %d bytes/s",
              vlan_str, POLL_INTERVAL_SECONDS, THROTTLE_PROFILE_ID or "NOT SET",
@@ -265,7 +324,7 @@ def main() -> None:
         if state.get("last_reset_date") != date.today().isoformat():
             run_reset(clients)
 
-        run_monitor(clients)
+        run_monitor(clients, messages)
         log.info("Sleeping %ds until next poll.", POLL_INTERVAL_SECONDS)
         time.sleep(POLL_INTERVAL_SECONDS)
 
