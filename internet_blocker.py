@@ -208,26 +208,23 @@ def _update_user(mac: str, updates: dict) -> bool:
 
 
 def _apply_and_reconnect(mac: str, profile_label: str) -> None:
-    """Block the device, wait for AP to sync the new profile, then unblock."""
-    log.info("[%s] Sending block-sta to disconnect device.", mac)
-    _stamgr("block-sta", mac)
+    """Wait for AP to sync the new profile, then kick to force reconnection."""
+    log.info("[%s] Waiting 5s for AP to sync profile '%s'.", mac, profile_label)
+    time.sleep(5)
 
-    # Wait for device to disappear from active clients
+    log.info("[%s] Sending kick-sta to force reconnection.", mac)
+    _stamgr("kick-sta", mac)
+
+    # Wait for device to disappear (confirms kick worked)
     deadline = time.time() + 15
     while time.time() < deadline:
         time.sleep(1)
         active = fetch_active_clients()
         if active is None or mac not in active:
-            log.info("[%s] Device confirmed disconnected.", mac)
+            log.info("[%s] Device confirmed disconnected after kick.", mac)
             break
     else:
-        log.warning("[%s] Device still visible after 15s — continuing anyway.", mac)
-
-    log.info("[%s] Waiting 5s for AP to sync profile '%s'.", mac, profile_label)
-    time.sleep(5)
-
-    log.info("[%s] Sending unblock-sta — device may now reconnect.", mac)
-    _stamgr("unblock-sta", mac)
+        log.warning("[%s] Device still visible 15s after kick.", mac)
 
     # Watch for reconnection
     deadline = time.time() + 30
@@ -235,9 +232,9 @@ def _apply_and_reconnect(mac: str, profile_label: str) -> None:
         time.sleep(1)
         active = fetch_active_clients()
         if active is not None and mac in active:
-            log.info("[%s] Device reconnected. Profile '%s' should now be active.", mac, profile_label)
+            log.info("[%s] Device reconnected with profile '%s' active.", mac, profile_label)
             return
-    log.warning("[%s] Device did not reconnect within 30s after unblock.", mac)
+    log.warning("[%s] Device did not reconnect within 30s — may need manual WiFi toggle.", mac)
 
 
 def throttle_client(mac: str) -> bool:
