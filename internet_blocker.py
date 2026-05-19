@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import random
+import re
 import sys
 import time
 from datetime import date
@@ -56,6 +57,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 _telegram_offset = 0
+_conversation: dict = {"step": None}  # tracks multi-step /add flow per session
 
 
 # ---------------------------------------------------------------------------
@@ -287,54 +289,103 @@ def _parse_limit(quota: str) -> int | None:
     return int(quota.lower().replace("min", "")) * 60
 
 
+def _valid_mac(mac: str) -> bool:
+    return bool(re.match(r"^([0-9a-f]{2}:){5}[0-9a-f]{2}$", mac.lower()))
+
+
+def _do_add(name: str, mac: str, limit_seconds: int | None, phone: str | None,
+            clients: dict) -> None:
+    """Persist and activate a new client."""
+    new_client = {"mac": mac, "limit_seconds": limit_seconds, "phone": phone}
+    clients[name] = new_client
+    dynamic = load_dynamic_clients()
+    dynamic[name] = new_client
+    save_dynamic_clients(dynamic)
+
+    wlan_ok = add_to_wlan_allowlist(mac)
+
+    limit_str = f"{limit_seconds // 60}min" if limit_seconds else "ubegrenset"
+    sms_str = f"SMS til {phone}" if phone else "ingen SMS"
+    wlan_str = "✅ Lagt til i wifi-allowlist." if wlan_ok else "⚠️ Kunne ikke oppdatere wifi-allowlist — sjekk WLAN_NAME i .env."
+    send_telegram(
+        f"✅ {name} er lagt til!\n"
+        f"• MAC: {mac}\n"
+        f"• Grense: {limit_str}\n"
+        f"• {sms_str}\n"
+        f"• {wlan_str}"
+    )
+    log.info("Added %s (%s) via Telegram.", name, mac)
+
+
 def handle_telegram_command(text: str, clients: dict) -> None:
-    parts = text.strip().split()
-    cmd = parts[0].lower() if parts else ""
+    global _conversation
+    text = text.strip()
+    cmd = text.lower().split()[0] if text else ""
 
-    if cmd == "/add":
-        # /add name mac limit [phone]
-        if len(parts) < 4:
-            send_telegram(
-                "❌ Format: /add navn mac grense [tlf]\n"
-                "Eks: /add dag_kone aa:bb:cc:dd:ee:ff 60min +4712345678\n"
-                "     /add dag_kone aa:bb:cc:dd:ee:ff unlimited"
-            )
+    # Cancel works at any point
+    if cmd == "/cancel":
+        _conversation = {"step": None}
+        send_telegram("❌ Avbrutt.")
+        return
+
+    step = _conversation.get("step")
+
+    # --- No active conversation: expect a command ---
+    if step is None:
+        if cmd == "/add":
+            _conversation = {"step": "awaiting_name"}
+            send_telegram("Hva skal personen hete? (f.eks. dag_kone, ingen mellomrom)")
+        elif cmd == "/list":
+            if not clients:
+                send_telegram("Ingen klienter konfigurert.")
+                return
+            lines = ["📋 Aktive klienter:\n"]
+            dynamic_names = load_dynamic_clients().keys()
+            for name, cfg in clients.items():
+                limit_str = f"{cfg['limit_seconds'] // 60}min" if cfg["limit_seconds"] else "ubegrenset"
+                source = "(lagt til)" if name in dynamic_names else "(.env)"
+                lines.append(f"• {name} — {cfg['mac']} — {limit_str} {source}")
+            send_telegram("\n".join(lines))
+        else:
+            send_telegram("Tilgjengelige kommandoer:\n/add — legg til ny person\n/list — vis alle")
+        return
+
+    # --- Active conversation steps ---
+    if step == "awaiting_name":
+        if not text or " " in text:
+            send_telegram("❌ Navn kan ikke inneholde mellomrom. Prøv igjen:")
             return
-        name, mac, quota = parts[1], parts[2].lower(), parts[3]
-        phone = parts[4] if len(parts) >= 5 else None
+        _conversation["name"] = text
+        _conversation["step"] = "awaiting_mac"
+        send_telegram(f"MAC-adresse til {text}?\n(format: aa:bb:cc:dd:ee:ff)")
+
+    elif step == "awaiting_mac":
+        if not _valid_mac(text):
+            send_telegram("❌ Ugyldig MAC-adresse. Format: aa:bb:cc:dd:ee:ff\nPrøv igjen:")
+            return
+        _conversation["mac"] = text.lower()
+        _conversation["step"] = "awaiting_limit"
+        send_telegram("Tidsgrense per dag?\n• 60min\n• unlimited")
+
+    elif step == "awaiting_limit":
         try:
-            limit_seconds = _parse_limit(quota)
+            _conversation["limit_seconds"] = _parse_limit(text)
         except ValueError:
-            send_telegram(f"❌ Ugyldig grense: {quota!r}. Bruk f.eks. 60min eller unlimited.")
+            send_telegram("❌ Skriv f.eks. 60min eller unlimited:")
             return
+        _conversation["step"] = "awaiting_phone"
+        send_telegram("Telefonnummer for SMS-varsler?\n(format: +4712345678, eller 'skip' for ingen SMS)")
 
-        new_client = {"mac": mac, "limit_seconds": limit_seconds, "phone": phone}
-        clients[name] = new_client
-
-        dynamic = load_dynamic_clients()
-        dynamic[name] = new_client
-        save_dynamic_clients(dynamic)
-
-        wlan_ok = add_to_wlan_allowlist(mac)
-
-        limit_str = f"{limit_seconds // 60}min" if limit_seconds else "ubegrenset"
-        wlan_str = " og lagt til i wifi-allowlist ✅" if wlan_ok else "\n⚠️ Kunne ikke oppdatere wifi-allowlist — sjekk WLAN_NAME i .env."
-        send_telegram(f"✅ {name} ({mac}) lagt til med {limit_str} kvote{wlan_str}")
-        log.info("Added %s (%s) via Telegram.", name, mac)
-
-    elif cmd == "/list":
-        if not clients:
-            send_telegram("Ingen klienter konfigurert.")
-            return
-        lines = ["📋 Aktive klienter:\n"]
-        for name, cfg in clients.items():
-            limit_str = f"{cfg['limit_seconds'] // 60}min" if cfg["limit_seconds"] else "ubegrenset"
-            source = "(.env)" if name not in load_dynamic_clients() else "(lagt til)"
-            lines.append(f"• {name} — {cfg['mac']} — {limit_str} {source}")
-        send_telegram("\n".join(lines))
-
-    else:
-        send_telegram("Ukjente kommandoer. Tilgjengelige:\n/add navn mac grense [tlf]\n/list")
+    elif step == "awaiting_phone":
+        phone = None if text.lower() == "skip" else text
+        _do_add(
+            name=_conversation["name"],
+            mac=_conversation["mac"],
+            limit_seconds=_conversation["limit_seconds"],
+            phone=phone,
+            clients=clients,
+        )
+        _conversation = {"step": None}
 
 
 def check_telegram(clients: dict) -> None:
