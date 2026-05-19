@@ -435,7 +435,24 @@ def handle_callback_query(callback_query_id: str, data: str, clients: dict) -> N
     global _conversation
     parts = data.split(":")
 
-    if parts[0] == "add_person" and len(parts) == 2:
+    def _mac_from_flat(flat: str) -> str:
+        return ":".join(flat[i:i+2] for i in range(0, 12, 2))
+
+    if parts[0] == "assign" and len(parts) == 3:
+        mac, name = _mac_from_flat(parts[1]), parts[2]
+        if name not in clients:
+            answer_callback(callback_query_id, "Klient ikke funnet.")
+            return
+        answer_callback(callback_query_id)
+        _do_add_mac(name, mac, clients)
+
+    elif parts[0] == "assign_new" and len(parts) == 2:
+        mac = _mac_from_flat(parts[1])
+        answer_callback(callback_query_id)
+        _conversation = {"step": "awaiting_name", "preset_mac": mac}
+        send_telegram(f"Hva skal personen hete?\n(MAC {mac} legges til automatisk)")
+
+    elif parts[0] == "add_person" and len(parts) == 2:
         name = parts[1]
         if name not in clients:
             answer_callback(callback_query_id, "Klient ikke funnet.")
@@ -597,8 +614,12 @@ def handle_telegram_command(text: str, clients: dict) -> None:
             send_telegram("❌ Navn kan ikke inneholde mellomrom. Prøv igjen:")
             return
         _conversation["name"] = text
-        _conversation["step"] = "awaiting_mac"
-        send_telegram(f"MAC-adresse til {text}?\n(format: aa:bb:cc:dd:ee:ff)")
+        if "preset_mac" in _conversation:
+            _conversation["step"] = "awaiting_limit"
+            send_telegram("Tidsgrense per dag?\n• 60min\n• unlimited")
+        else:
+            _conversation["step"] = "awaiting_mac"
+            send_telegram(f"MAC-adresse til {text}?\n(format: aa:bb:cc:dd:ee:ff)")
 
     elif step == "awaiting_mac":
         if not _valid_mac(text):
@@ -621,7 +642,7 @@ def handle_telegram_command(text: str, clients: dict) -> None:
         phone = None if text.lower() == "skip" else text
         _do_add(
             name=_conversation["name"],
-            mac=_conversation["mac"],
+            mac=_conversation.get("preset_mac") or _conversation.get("mac"),
             limit_seconds=_conversation["limit_seconds"],
             phone=phone,
             clients=clients,
@@ -729,11 +750,13 @@ def handle_unknown_devices(active_network_clients: dict, clients: dict, state: d
             throttle_client(mac)
             unknown_devices[mac] = {"hostname": hostname, "first_seen": date.today().isoformat()}
             if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-                send_telegram(
-                    f"Ukjent enhet på nettverket:\n"
-                    f"  MAC: {mac}\n"
-                    f"  Navn: {hostname}\n\n"
-                    f"Bruk /add for å registrere den."
+                mac_flat = mac.replace(":", "")
+                keyboard = [[{"text": name, "callback_data": f"assign:{mac_flat}:{name}"}]
+                            for name in clients]
+                keyboard.append([{"text": "➕ Ny person", "callback_data": f"assign_new:{mac_flat}"}])
+                send_telegram_buttons(
+                    f"Ukjent enhet på nettverket:\n  {hostname} ({mac})\nHvem eier den?",
+                    keyboard
                 )
         else:
             throttle_client(mac)
