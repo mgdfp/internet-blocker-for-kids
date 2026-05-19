@@ -470,7 +470,8 @@ def handle_telegram_command(text: str, clients: dict) -> None:
                 for name, cfg in clients.items():
                     limit_str = f"{cfg['limit_seconds'] // 60}min" if cfg["limit_seconds"] else "ubegrenset"
                     source = "(lagt til)" if name in dynamic_names else "(.env)"
-                    lines.append(f"• {name} — {cfg['mac']} — {limit_str} {source}")
+                    phone_str = cfg["phone"] if cfg.get("phone") else "ingen SMS"
+                    lines.append(f"• {name} — {cfg['mac']} — {limit_str} — {phone_str} {source}")
             if STATE_FILE.exists():
                 try:
                     with open(STATE_FILE) as f:
