@@ -207,25 +207,56 @@ def _update_user(mac: str, updates: dict) -> bool:
         return False
 
 
-def _apply_and_reconnect(mac: str) -> None:
+def _apply_and_reconnect(mac: str, profile_label: str) -> None:
     """Block the device, wait for AP to sync the new profile, then unblock."""
+    log.info("[%s] Sending block-sta to disconnect device.", mac)
     _stamgr("block-sta", mac)
+
+    # Wait for device to disappear from active clients
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        time.sleep(1)
+        active = fetch_active_clients()
+        if active is None or mac not in active:
+            log.info("[%s] Device confirmed disconnected.", mac)
+            break
+    else:
+        log.warning("[%s] Device still visible after 15s — continuing anyway.", mac)
+
+    log.info("[%s] Waiting 5s for AP to sync profile '%s'.", mac, profile_label)
     time.sleep(5)
+
+    log.info("[%s] Sending unblock-sta — device may now reconnect.", mac)
     _stamgr("unblock-sta", mac)
-    log.info("Device %s blocked and unblocked to apply new speed profile.", mac)
+
+    # Watch for reconnection
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        time.sleep(1)
+        active = fetch_active_clients()
+        if active is not None and mac in active:
+            log.info("[%s] Device reconnected. Profile '%s' should now be active.", mac, profile_label)
+            return
+    log.warning("[%s] Device did not reconnect within 30s after unblock.", mac)
 
 
 def throttle_client(mac: str) -> bool:
     ok = _update_user(mac, {"usergroup_id": THROTTLE_PROFILE_ID})
     if ok:
-        _apply_and_reconnect(mac)
+        log.info("[%s] Speed limit profile applied in controller (usergroup_id=%s).", mac, THROTTLE_PROFILE_ID)
+        _apply_and_reconnect(mac, "throttled")
+    else:
+        log.error("[%s] Failed to apply speed limit profile.", mac)
     return ok
 
 
 def unthrottle_client(mac: str) -> bool:
     ok = _update_user(mac, {"usergroup_id": ""})
     if ok:
-        _apply_and_reconnect(mac)
+        log.info("[%s] Speed limit profile removed in controller.", mac)
+        _apply_and_reconnect(mac, "unlimited")
+    else:
+        log.error("[%s] Failed to remove speed limit profile.", mac)
     return ok
 
 
