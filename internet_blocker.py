@@ -284,6 +284,33 @@ def send_telegram(text: str) -> None:
         log.error("Failed to send Telegram message: %s", e)
 
 
+def send_telegram_buttons(text: str, keyboard: list) -> None:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text,
+                  "reply_markup": {"inline_keyboard": keyboard}},
+            timeout=10,
+        )
+    except requests.RequestException as e:
+        log.error("Failed to send Telegram buttons: %s", e)
+
+
+def answer_callback(callback_query_id: str, text: str = "") -> None:
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+            json={"callback_query_id": callback_query_id, "text": text},
+            timeout=10,
+        )
+    except requests.RequestException as e:
+        log.error("Failed to answer callback: %s", e)
+
+
 def _pick_message(messages: dict, event: str, **kwargs) -> str:
     options = messages.get(event, [])
     if not options:
@@ -341,6 +368,75 @@ def _do_add(name: str, mac: str, limit_seconds: int | None, phone: str | None,
     log.info("Added %s (%s) via Telegram.", name, mac)
 
 
+def _load_state_raw() -> dict:
+    if not STATE_FILE.exists():
+        return {}
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def handle_callback_query(callback_query_id: str, data: str, clients: dict) -> None:
+    global _conversation
+    parts = data.split(":")
+
+    if parts[0] == "modify" and len(parts) == 2:
+        name = parts[1]
+        if name not in clients:
+            answer_callback(callback_query_id, "Klient ikke funnet.")
+            return
+        answer_callback(callback_query_id)
+        cfg = clients[name]
+        state = _load_state_raw()
+        throttled = state.get(name, {}).get("throttled", False)
+        limit_str = f"{cfg['limit_seconds'] // 60}min" if cfg["limit_seconds"] else "ubegrenset"
+        block_label = "✅ Frigjør" if throttled else "🚫 Blokker"
+        keyboard = [
+            [{"text": "✏️ Endre kvote", "callback_data": f"action:{name}:quota"}],
+            [{"text": block_label,        "callback_data": f"action:{name}:block"}],
+            [{"text": "🔄 Nullstill teller", "callback_data": f"action:{name}:reset"}],
+        ]
+        send_telegram_buttons(f"{name} — kvote: {limit_str}\nHva vil du gjøre?", keyboard)
+
+    elif parts[0] == "action" and len(parts) == 3:
+        name, action = parts[1], parts[2]
+        if name not in clients:
+            answer_callback(callback_query_id, "Klient ikke funnet.")
+            return
+        mac = clients[name]["mac"]
+        state = _load_state_raw()
+
+        if action == "quota":
+            answer_callback(callback_query_id)
+            _conversation = {"step": "awaiting_quota_minutes", "target": name}
+            send_telegram(f"Ny daglig kvote for {name}?\nSkriv antall minutter eller 'unlimited':")
+
+        elif action == "block":
+            throttled = state.get(name, {}).get("throttled", False)
+            if throttled:
+                unthrottle_client(mac)
+                state.setdefault(name, {})["throttled"] = False
+                save_state(state)
+                answer_callback(callback_query_id, "✅ Frigjort!")
+                send_telegram(f"✅ {name} er frigjort.")
+            else:
+                throttle_client(mac)
+                state.setdefault(name, {})["throttled"] = True
+                save_state(state)
+                answer_callback(callback_query_id, "🚫 Blokkert!")
+                send_telegram(f"🚫 {name} er blokkert.")
+
+        elif action == "reset":
+            unthrottle_client(mac)
+            state[name] = {"seconds": 0, "throttled": False, "notified_half": False}
+            save_state(state)
+            answer_callback(callback_query_id, "🔄 Nullstilt!")
+            send_telegram(f"🔄 {name} er nullstilt og frigjort.")
+            log.info("%s reset via Telegram.", name)
+
+
 def handle_telegram_command(text: str, clients: dict) -> None:
     global _conversation
     text = text.strip()
@@ -359,6 +455,12 @@ def handle_telegram_command(text: str, clients: dict) -> None:
         if cmd == "/add":
             _conversation = {"step": "awaiting_name"}
             send_telegram("Hva skal personen hete? (f.eks. dag_kone, ingen mellomrom)")
+        elif cmd == "/modify":
+            if not clients:
+                send_telegram("Ingen klienter å endre.")
+                return
+            keyboard = [[{"text": name, "callback_data": f"modify:{name}"}] for name in clients]
+            send_telegram_buttons("Velg person å endre:", keyboard)
         elif cmd == "/list":
             lines = []
             if clients:
@@ -384,7 +486,7 @@ def handle_telegram_command(text: str, clients: dict) -> None:
                 return
             send_telegram("\n".join(lines))
         else:
-            send_telegram("Tilgjengelige kommandoer:\n/add — legg til ny person\n/list — vis alle")
+            send_telegram("Tilgjengelige kommandoer:\n/add — legg til ny person\n/modify — endre kvote/blokker/nullstill\n/list — vis alle")
         return
 
     # --- Active conversation steps ---
@@ -424,6 +526,27 @@ def handle_telegram_command(text: str, clients: dict) -> None:
         )
         _conversation = {"step": None}
 
+    elif step == "awaiting_quota_minutes":
+        target = _conversation.get("target")
+        try:
+            limit_seconds = _parse_limit(text)
+        except ValueError:
+            send_telegram("❌ Skriv f.eks. 60min eller unlimited:")
+            return
+        if target and target in clients:
+            clients[target]["limit_seconds"] = limit_seconds
+            dynamic = load_dynamic_clients()
+            entry = dynamic.get(target) or dict(clients[target])
+            entry["limit_seconds"] = limit_seconds
+            dynamic[target] = entry
+            save_dynamic_clients(dynamic)
+            limit_str = f"{limit_seconds // 60}min" if limit_seconds else "ubegrenset"
+            send_telegram(f"✅ Kvote for {target} endret til {limit_str}.")
+            log.info("Quota for %s updated to %s via Telegram.", target, limit_str)
+        else:
+            send_telegram("❌ Klient ikke funnet.")
+        _conversation = {"step": None}
+
 
 def check_telegram(clients: dict) -> None:
     global _telegram_offset
@@ -439,6 +562,16 @@ def check_telegram(clients: dict) -> None:
         resp.raise_for_status()
         for update in resp.json().get("result", []):
             _telegram_offset = update["update_id"] + 1
+
+            cb = update.get("callback_query")
+            if cb:
+                chat_id = str(cb.get("message", {}).get("chat", {}).get("id", ""))
+                if chat_id == TELEGRAM_CHAT_ID:
+                    handle_callback_query(cb["id"], cb.get("data", ""), clients)
+                else:
+                    log.warning("Ignoring callback from unknown chat ID %s.", chat_id)
+                continue
+
             msg = update.get("message", {})
             chat_id = str(msg.get("chat", {}).get("id", ""))
             if chat_id != TELEGRAM_CHAT_ID:
