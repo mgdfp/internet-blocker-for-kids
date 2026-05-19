@@ -780,7 +780,7 @@ def handle_unknown_devices(active_network_clients: dict, clients: dict, state: d
                     keyboard
                 )
         else:
-            throttle_client(mac)
+            pass  # already throttled — profile persists in UniFi, no need to re-apply
 
 
 def run_monitor(clients: dict, messages: dict) -> None:
