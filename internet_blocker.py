@@ -761,14 +761,26 @@ def run_reset(clients: dict) -> None:
 def handle_unknown_devices(active_network_clients: dict, clients: dict, state: dict) -> None:
     known_macs = {mac for cfg in clients.values() for mac in cfg["macs"]}
     unknown_devices = state.setdefault("unknown_devices", {})
+    pending = state.setdefault("pending_unknown", {})
+
+    # Remove pending entries that are no longer on the network (brief visitors)
+    for mac in list(pending):
+        if mac not in active_network_clients:
+            log.info("Pending unknown %s left before second poll — ignoring.", mac)
+            del pending[mac]
 
     for mac, client in active_network_clients.items():
-        if mac in known_macs:
+        if mac in known_macs or mac in unknown_devices:
             continue
-        if mac not in unknown_devices:
-            hostname = client.get("hostname") or client.get("name") or mac
-            log.info("Unknown device detected: %s (%s) — throttling.", hostname, mac)
+        hostname = client.get("hostname") or client.get("name") or mac
+        if mac not in pending:
+            log.info("Unknown device first seen: %s (%s) — waiting for next poll to confirm.", hostname, mac)
+            pending[mac] = {"hostname": hostname}
+        else:
+            # Seen two polls in a row — it's staying, throttle and notify
+            log.info("Unknown device confirmed: %s (%s) — throttling.", hostname, mac)
             throttle_client(mac)
+            del pending[mac]
             unknown_devices[mac] = {"hostname": hostname, "first_seen": date.today().isoformat()}
             if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
                 mac_flat = mac.replace(":", "")
@@ -779,8 +791,6 @@ def handle_unknown_devices(active_network_clients: dict, clients: dict, state: d
                     f"Ukjent enhet på nettverket:\n  {hostname} ({mac})\nHvem eier den?",
                     keyboard
                 )
-        else:
-            pass  # already throttled — profile persists in UniFi, no need to re-apply
 
 
 def run_monitor(clients: dict, messages: dict) -> None:
