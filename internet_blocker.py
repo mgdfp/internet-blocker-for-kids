@@ -207,19 +207,29 @@ def _update_user(mac: str, updates: dict) -> bool:
         return False
 
 
+def _kick_and_wait(mac: str, timeout: int = 15) -> None:
+    _stamgr("kick-sta", mac)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(1)
+        active = fetch_active_clients()
+        if active is None or mac not in active:
+            log.info("Device %s disconnected after kick.", mac)
+            return
+    log.warning("Device %s still visible %ds after kick — speed limit may not apply immediately.", mac, timeout)
+
+
 def throttle_client(mac: str) -> bool:
     ok = _update_user(mac, {"usergroup_id": THROTTLE_PROFILE_ID})
     if ok:
-        time.sleep(2)
-        _stamgr("kick-sta", mac)
+        _kick_and_wait(mac)
     return ok
 
 
 def unthrottle_client(mac: str) -> bool:
     ok = _update_user(mac, {"usergroup_id": ""})
     if ok:
-        time.sleep(2)
-        _stamgr("kick-sta", mac)
+        _kick_and_wait(mac)
     return ok
 
 
