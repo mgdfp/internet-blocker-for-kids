@@ -176,6 +176,9 @@ def _stamgr(cmd: str, mac: str) -> bool:
     try:
         resp = requests.post(url, headers=_headers(), json={"cmd": cmd, "mac": mac},
                              verify=False, timeout=10)
+        if resp.status_code == 400:
+            log.debug("stamgr %s %s: device not connected, skipping.", cmd, mac)
+            return True
         resp.raise_for_status()
         return True
     except requests.RequestException as e:
@@ -205,11 +208,19 @@ def _update_user(mac: str, updates: dict) -> bool:
 
 
 def throttle_client(mac: str) -> bool:
-    return _update_user(mac, {"usergroup_id": THROTTLE_PROFILE_ID})
+    ok = _update_user(mac, {"usergroup_id": THROTTLE_PROFILE_ID})
+    if ok:
+        time.sleep(2)
+        _stamgr("kick-sta", mac)
+    return ok
 
 
 def unthrottle_client(mac: str) -> bool:
-    return _update_user(mac, {"usergroup_id": ""})
+    ok = _update_user(mac, {"usergroup_id": ""})
+    if ok:
+        time.sleep(2)
+        _stamgr("kick-sta", mac)
+    return ok
 
 
 def add_to_wlan_allowlist(mac: str) -> bool:
@@ -419,10 +430,11 @@ def check_telegram(clients: dict) -> None:
     if not TELEGRAM_BOT_TOKEN:
         return
     try:
+        long_poll = max(5, POLL_INTERVAL_SECONDS - 5)
         resp = requests.get(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
-            params={"offset": _telegram_offset, "timeout": 0},
-            timeout=5,
+            params={"offset": _telegram_offset, "timeout": long_poll},
+            timeout=long_poll + 10,
         )
         resp.raise_for_status()
         for update in resp.json().get("result", []):
@@ -506,22 +518,37 @@ def run_monitor(clients: dict, messages: dict) -> None:
         client = active_network_clients.get(mac)
         if client is None:
             log.info("%s not on network.", name)
+            person.pop("tx_bytes", None)
             continue
 
-        rx_rate = client.get("rx_rate") or 0
-        if rx_rate < ACTIVE_RATE_THRESHOLD_BYTES_PER_SEC:
-            log.info("%s idle (rx_rate=%d bytes/s), not counting.", name, rx_rate)
+        tx_bytes = client.get("tx_bytes") or 0
+        prev_tx_bytes = person.get("tx_bytes")
+        person["tx_bytes"] = tx_bytes
+
+        if prev_tx_bytes is None:
+            log.info("%s first seen this session — waiting for next poll to measure usage.", name)
+            continue
+
+        delta_bytes = tx_bytes - prev_tx_bytes
+        if delta_bytes < 0:
+            # Counter reset (device reconnected) — skip this interval
+            log.info("%s tx_bytes counter reset, skipping interval.", name)
+            continue
+
+        avg_rate = delta_bytes / POLL_INTERVAL_SECONDS
+        if avg_rate < ACTIVE_RATE_THRESHOLD_BYTES_PER_SEC:
+            log.info("%s idle (avg %.0f bytes/s over last %ds), not counting.", name, avg_rate, POLL_INTERVAL_SECONDS)
             continue
 
         person["seconds"] += POLL_INTERVAL_SECONDS
         minutes_used = person["seconds"] // 60
 
         if limit_seconds is None:
-            log.info("%s active — %dm used (unlimited).", name, minutes_used)
+            log.info("%s active — %dm used (unlimited) [avg dl %.0f bytes/s].", name, minutes_used, avg_rate)
             continue
 
         limit_minutes = limit_seconds // 60
-        log.info("%s active — %dm/%dm used.", name, minutes_used, limit_minutes)
+        log.info("%s active — %dm/%dm used [avg dl %.0f bytes/s].", name, minutes_used, limit_minutes, avg_rate)
 
         # 50% notification
         if not person.get("notified_half") and person["seconds"] >= limit_seconds // 2:
@@ -603,15 +630,13 @@ def main() -> None:
         log.info("Telegram bot active — listening for admin commands.")
 
     while True:
-        check_telegram(clients)
+        check_telegram(clients)  # long-polls for up to POLL_INTERVAL_SECONDS-5s
 
         state = load_state(clients)
         if state.get("last_reset_date") != date.today().isoformat():
             run_reset(clients)
 
         run_monitor(clients, messages)
-        log.info("Sleeping %ds until next poll.", POLL_INTERVAL_SECONDS)
-        time.sleep(POLL_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":
