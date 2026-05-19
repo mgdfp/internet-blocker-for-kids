@@ -28,10 +28,17 @@ VLAN_ID = int(os.getenv("VLAN_ID", "0")) or None
 # and reading the "usergroup_id" field after applying the profile in the UI.
 THROTTLE_PROFILE_ID = os.getenv("THROTTLE_PROFILE_ID", "")
 
-# Twilio credentials for SMS notifications.
+# Name of the VLAN4 WiFi network in UniFi (used to update the MAC allowlist).
+WLAN_NAME = os.getenv("WLAN_NAME", "")
+
+# Twilio credentials for SMS notifications to kids.
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
 TWILIO_FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER", "")
+
+# Telegram bot for admin commands from Morgan.
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")  # Morgan's personal chat ID
 
 # Minimum rx_rate in bytes/sec to count as active use (default: 50 Kbps = 6250 bytes/sec).
 # Increase this if idle background sync is triggering false counts.
@@ -39,6 +46,7 @@ ACTIVE_RATE_THRESHOLD_BYTES_PER_SEC = 6_250
 
 STATE_FILE = Path(__file__).parent / "data" / "state.json"
 MESSAGES_FILE = Path(__file__).parent / "messages.json"
+DYNAMIC_CLIENTS_FILE = Path(__file__).parent / "data" / "dynamic_clients.json"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,6 +55,12 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+_telegram_offset = 0
+
+
+# ---------------------------------------------------------------------------
+# Client loading
+# ---------------------------------------------------------------------------
 
 def load_clients() -> dict[str, dict]:
     """
@@ -76,18 +90,36 @@ def load_clients() -> dict[str, dict]:
     return clients
 
 
+def load_dynamic_clients() -> dict:
+    """Load clients added at runtime via Telegram /add command."""
+    if DYNAMIC_CLIENTS_FILE.exists():
+        try:
+            with open(DYNAMIC_CLIENTS_FILE) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            log.warning("Could not read dynamic_clients.json — starting with empty dynamic list.")
+    return {}
+
+
+def save_dynamic_clients(dynamic: dict) -> None:
+    tmp = DYNAMIC_CLIENTS_FILE.with_suffix(".tmp")
+    with open(tmp, "w") as f:
+        json.dump(dynamic, f, indent=2)
+    os.replace(tmp, DYNAMIC_CLIENTS_FILE)
+
+
 def load_messages() -> dict:
     try:
         with open(MESSAGES_FILE) as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError) as e:
-        log.warning("Could not load messages.json: %s — SMS notifications will use fallback text.", e)
+        log.warning("Could not load messages.json: %s — SMS will use fallback text.", e)
         return {}
 
 
-def _headers() -> dict:
-    return {"X-API-Key": API_KEY}
-
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
 
 def load_state(clients: dict) -> dict:
     if STATE_FILE.exists():
@@ -112,6 +144,14 @@ def save_state(state: dict) -> None:
     with open(tmp, "w") as f:
         json.dump(state, f, indent=2)
     os.replace(tmp, STATE_FILE)
+
+
+# ---------------------------------------------------------------------------
+# UniFi API
+# ---------------------------------------------------------------------------
+
+def _headers() -> dict:
+    return {"X-API-Key": API_KEY}
 
 
 def fetch_active_clients() -> dict[str, dict] | None:
@@ -170,6 +210,36 @@ def unthrottle_client(mac: str) -> bool:
     return _update_user(mac, {"usergroup_id": ""})
 
 
+def add_to_wlan_allowlist(mac: str) -> bool:
+    if not WLAN_NAME:
+        log.warning("WLAN_NAME not set — skipping allowlist update.")
+        return False
+    url = f"https://{UDM_IP}/proxy/network/api/s/default/rest/wlanconf"
+    try:
+        resp = requests.get(url, headers=_headers(), verify=False, timeout=10)
+        resp.raise_for_status()
+        wlan = next((w for w in resp.json().get("data", [])
+                     if w.get("name") == WLAN_NAME), None)
+        if not wlan:
+            log.error("WLAN %r not found in UniFi.", WLAN_NAME)
+            return False
+        mac_list = wlan.get("mac_filter_list", [])
+        if mac not in mac_list:
+            mac_list.append(mac)
+            wlan["mac_filter_list"] = mac_list
+            put_resp = requests.put(f"{url}/{wlan['_id']}", headers=_headers(),
+                                    json=wlan, verify=False, timeout=10)
+            put_resp.raise_for_status()
+        return True
+    except requests.RequestException as e:
+        log.error("Failed to update WLAN allowlist: %s", e)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Notifications
+# ---------------------------------------------------------------------------
+
 def send_sms(to_number: str, body: str) -> None:
     if not all([to_number, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER]):
         return
@@ -186,12 +256,115 @@ def send_sms(to_number: str, body: str) -> None:
         log.error("Failed to send SMS to %s: %s", to_number, e)
 
 
+def send_telegram(text: str) -> None:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
+            timeout=10,
+        )
+    except requests.RequestException as e:
+        log.error("Failed to send Telegram message: %s", e)
+
+
 def _pick_message(messages: dict, event: str, **kwargs) -> str:
     options = messages.get(event, [])
     if not options:
         return ""
     return random.choice(options).format(**kwargs)
 
+
+# ---------------------------------------------------------------------------
+# Telegram bot
+# ---------------------------------------------------------------------------
+
+def _parse_limit(quota: str) -> int | None:
+    """Parse '60min' -> 3600, 'unlimited' -> None. Raises ValueError on bad input."""
+    if quota.lower() == "unlimited":
+        return None
+    return int(quota.lower().replace("min", "")) * 60
+
+
+def handle_telegram_command(text: str, clients: dict) -> None:
+    parts = text.strip().split()
+    cmd = parts[0].lower() if parts else ""
+
+    if cmd == "/add":
+        # /add name mac limit [phone]
+        if len(parts) < 4:
+            send_telegram(
+                "❌ Format: /add navn mac grense [tlf]\n"
+                "Eks: /add dag_kone aa:bb:cc:dd:ee:ff 60min +4712345678\n"
+                "     /add dag_kone aa:bb:cc:dd:ee:ff unlimited"
+            )
+            return
+        name, mac, quota = parts[1], parts[2].lower(), parts[3]
+        phone = parts[4] if len(parts) >= 5 else None
+        try:
+            limit_seconds = _parse_limit(quota)
+        except ValueError:
+            send_telegram(f"❌ Ugyldig grense: {quota!r}. Bruk f.eks. 60min eller unlimited.")
+            return
+
+        new_client = {"mac": mac, "limit_seconds": limit_seconds, "phone": phone}
+        clients[name] = new_client
+
+        dynamic = load_dynamic_clients()
+        dynamic[name] = new_client
+        save_dynamic_clients(dynamic)
+
+        wlan_ok = add_to_wlan_allowlist(mac)
+
+        limit_str = f"{limit_seconds // 60}min" if limit_seconds else "ubegrenset"
+        wlan_str = " og lagt til i wifi-allowlist ✅" if wlan_ok else "\n⚠️ Kunne ikke oppdatere wifi-allowlist — sjekk WLAN_NAME i .env."
+        send_telegram(f"✅ {name} ({mac}) lagt til med {limit_str} kvote{wlan_str}")
+        log.info("Added %s (%s) via Telegram.", name, mac)
+
+    elif cmd == "/list":
+        if not clients:
+            send_telegram("Ingen klienter konfigurert.")
+            return
+        lines = ["📋 Aktive klienter:\n"]
+        for name, cfg in clients.items():
+            limit_str = f"{cfg['limit_seconds'] // 60}min" if cfg["limit_seconds"] else "ubegrenset"
+            source = "(.env)" if name not in load_dynamic_clients() else "(lagt til)"
+            lines.append(f"• {name} — {cfg['mac']} — {limit_str} {source}")
+        send_telegram("\n".join(lines))
+
+    else:
+        send_telegram("Ukjente kommandoer. Tilgjengelige:\n/add navn mac grense [tlf]\n/list")
+
+
+def check_telegram(clients: dict) -> None:
+    global _telegram_offset
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    try:
+        resp = requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+            params={"offset": _telegram_offset, "timeout": 0},
+            timeout=5,
+        )
+        resp.raise_for_status()
+        for update in resp.json().get("result", []):
+            _telegram_offset = update["update_id"] + 1
+            msg = update.get("message", {})
+            chat_id = str(msg.get("chat", {}).get("id", ""))
+            if chat_id != TELEGRAM_CHAT_ID:
+                log.warning("Ignoring Telegram message from unknown chat ID %s.", chat_id)
+                continue
+            text = msg.get("text", "").strip()
+            if text:
+                handle_telegram_command(text, clients)
+    except requests.RequestException as e:
+        log.error("Telegram poll failed: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Monitor & reset
+# ---------------------------------------------------------------------------
 
 def run_reset(clients: dict) -> None:
     log.info("Running daily reset — unblocking and removing rate limits for all clients.")
@@ -273,12 +446,17 @@ def run_monitor(clients: dict, messages: dict) -> None:
     save_state(state)
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 def main() -> None:
     if not UDM_IP or not API_KEY:
         log.error("UDM_IP and UNIFI_API_KEY must be set in .env")
         sys.exit(1)
 
     clients = load_clients()
+    clients.update(load_dynamic_clients())
     if not clients:
         log.error("No CLIENT* entries found in .env. See .env.example for format.")
         sys.exit(1)
@@ -318,8 +496,12 @@ def main() -> None:
     log.info("Polling %s every %ds | Throttle profile: %s | Active threshold: %d bytes/s",
              vlan_str, POLL_INTERVAL_SECONDS, THROTTLE_PROFILE_ID or "NOT SET",
              ACTIVE_RATE_THRESHOLD_BYTES_PER_SEC)
+    if TELEGRAM_BOT_TOKEN:
+        log.info("Telegram bot active — listening for admin commands.")
 
     while True:
+        check_telegram(clients)
+
         state = load_state(clients)
         if state.get("last_reset_date") != date.today().isoformat():
             run_reset(clients)
