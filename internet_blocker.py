@@ -129,7 +129,7 @@ def load_state(clients: dict) -> dict:
             with open(STATE_FILE) as f:
                 state = json.load(f)
             for key, entry in state.items():
-                if key == "last_reset_date":
+                if key in ("last_reset_date", "unknown_devices"):
                     continue
                 if "minutes" in entry and "seconds" not in entry:
                     entry["seconds"] = entry.pop("minutes") * 60
@@ -229,6 +229,8 @@ def add_to_wlan_allowlist(mac: str) -> bool:
         if mac not in mac_list:
             mac_list.append(mac)
             wlan["mac_filter_list"] = mac_list
+            # Note: intentionally not touching mac_filter_enabled —
+            # we maintain the list without enforcing it.
             put_resp = requests.put(f"{url}/{wlan['_id']}", headers=_headers(),
                                     json=wlan, verify=False, timeout=10)
             put_resp.raise_for_status()
@@ -295,24 +297,35 @@ def _valid_mac(mac: str) -> bool:
 
 def _do_add(name: str, mac: str, limit_seconds: int | None, phone: str | None,
             clients: dict) -> None:
-    """Persist and activate a new client."""
+    """Persist and activate a new client. Removes from unknown devices if present."""
     new_client = {"mac": mac, "limit_seconds": limit_seconds, "phone": phone}
     clients[name] = new_client
     dynamic = load_dynamic_clients()
     dynamic[name] = new_client
     save_dynamic_clients(dynamic)
 
-    wlan_ok = add_to_wlan_allowlist(mac)
+    # If this MAC was in the unknown devices list, remove it and unthrottle —
+    # it'll be tracked properly with its quota from now on.
+    if STATE_FILE.exists():
+        try:
+            with open(STATE_FILE) as f:
+                state = json.load(f)
+            if mac in state.get("unknown_devices", {}):
+                del state["unknown_devices"][mac]
+                unthrottle_client(mac)
+                save_state(state)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    add_to_wlan_allowlist(mac)
 
     limit_str = f"{limit_seconds // 60}min" if limit_seconds else "ubegrenset"
     sms_str = f"SMS til {phone}" if phone else "ingen SMS"
-    wlan_str = "✅ Lagt til i wifi-allowlist." if wlan_ok else "⚠️ Kunne ikke oppdatere wifi-allowlist — sjekk WLAN_NAME i .env."
     send_telegram(
         f"✅ {name} er lagt til!\n"
         f"• MAC: {mac}\n"
         f"• Grense: {limit_str}\n"
-        f"• {sms_str}\n"
-        f"• {wlan_str}"
+        f"• {sms_str}"
     )
     log.info("Added %s (%s) via Telegram.", name, mac)
 
@@ -336,15 +349,28 @@ def handle_telegram_command(text: str, clients: dict) -> None:
             _conversation = {"step": "awaiting_name"}
             send_telegram("Hva skal personen hete? (f.eks. dag_kone, ingen mellomrom)")
         elif cmd == "/list":
-            if not clients:
+            lines = []
+            if clients:
+                dynamic_names = load_dynamic_clients().keys()
+                lines.append("📋 Kjente klienter:\n")
+                for name, cfg in clients.items():
+                    limit_str = f"{cfg['limit_seconds'] // 60}min" if cfg["limit_seconds"] else "ubegrenset"
+                    source = "(lagt til)" if name in dynamic_names else "(.env)"
+                    lines.append(f"• {name} — {cfg['mac']} — {limit_str} {source}")
+            if STATE_FILE.exists():
+                try:
+                    with open(STATE_FILE) as f:
+                        state = json.load(f)
+                    unknowns = state.get("unknown_devices", {})
+                    if unknowns:
+                        lines.append("\n⚠️ Ukjente enheter (begrenset hastighet):\n")
+                        for mac, info in unknowns.items():
+                            lines.append(f"• {info.get('hostname', 'Ukjent')} — {mac}")
+                except (json.JSONDecodeError, OSError):
+                    pass
+            if not lines:
                 send_telegram("Ingen klienter konfigurert.")
                 return
-            lines = ["📋 Aktive klienter:\n"]
-            dynamic_names = load_dynamic_clients().keys()
-            for name, cfg in clients.items():
-                limit_str = f"{cfg['limit_seconds'] // 60}min" if cfg["limit_seconds"] else "ubegrenset"
-                source = "(lagt til)" if name in dynamic_names else "(.env)"
-                lines.append(f"• {name} — {cfg['mac']} — {limit_str} {source}")
             send_telegram("\n".join(lines))
         else:
             send_telegram("Tilgjengelige kommandoer:\n/add — legg til ny person\n/list — vis alle")
@@ -419,6 +445,7 @@ def check_telegram(clients: dict) -> None:
 
 def run_reset(clients: dict) -> None:
     log.info("Running daily reset — unblocking and removing rate limits for all clients.")
+    state = load_state(clients)
     for name, cfg in clients.items():
         mac = cfg["mac"]
         _stamgr("unblock-sta", mac)
@@ -426,8 +453,31 @@ def run_reset(clients: dict) -> None:
             log.info("Unthrottled %s (%s).", name, mac)
     fresh = {name: {"seconds": 0, "throttled": False, "notified_half": False} for name in clients}
     fresh["last_reset_date"] = date.today().isoformat()
+    fresh["unknown_devices"] = state.get("unknown_devices", {})  # unknown stay throttled
     save_state(fresh)
     log.info("Reset complete.")
+
+
+def handle_unknown_devices(active_network_clients: dict, clients: dict, state: dict) -> None:
+    known_macs = {cfg["mac"].lower() for cfg in clients.values()}
+    unknown_devices = state.setdefault("unknown_devices", {})
+
+    for mac, client in active_network_clients.items():
+        if mac in known_macs:
+            continue
+        if mac not in unknown_devices:
+            hostname = client.get("hostname") or client.get("name") or mac
+            log.info("Unknown device detected: %s (%s) — throttling.", hostname, mac)
+            throttle_client(mac)
+            unknown_devices[mac] = {"hostname": hostname, "first_seen": date.today().isoformat()}
+            if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+                msg = (f"Unknown device on network:\n"
+                       f"  MAC: `{mac}`\n"
+                       f"  Name: {hostname}\n\n"
+                       f"Use /add to register it.")
+                send_telegram(msg)
+        else:
+            throttle_client(mac)
 
 
 def run_monitor(clients: dict, messages: dict) -> None:
@@ -440,6 +490,8 @@ def run_monitor(clients: dict, messages: dict) -> None:
 
     vlan_str = f"VLAN{VLAN_ID}" if VLAN_ID else "all VLANs"
     log.info("--- Poll: %d device(s) on %s ---", len(active_network_clients), vlan_str)
+
+    handle_unknown_devices(active_network_clients, clients, state)
 
     for name, cfg in clients.items():
         mac = cfg["mac"]
