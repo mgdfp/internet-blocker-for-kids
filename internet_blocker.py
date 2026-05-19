@@ -316,6 +316,27 @@ def send_sms(to_number: str, body: str) -> None:
         log.error("Failed to send SMS to %s: %s", to_number, e)
 
 
+def register_telegram_commands() -> None:
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    commands = [
+        {"command": "add",     "description": "Legg til enhet"},
+        {"command": "modify",  "description": "Endre kvote / blokker / nullstill"},
+        {"command": "list",    "description": "Vis alle klienter og bruk"},
+        {"command": "debug",   "description": "Aktiver debug-varsler"},
+        {"command": "info",    "description": "Deaktiver debug-varsler"},
+        {"command": "cancel",  "description": "Avbryt pågående handling"},
+    ]
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setMyCommands",
+            json={"commands": commands},
+            timeout=10,
+        )
+    except requests.RequestException as e:
+        log.warning("Failed to register Telegram commands: %s", e)
+
+
 def send_telegram(text: str) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -946,6 +967,7 @@ def main() -> None:
              ACTIVE_RATE_THRESHOLD_BYTES_PER_SEC)
     if TELEGRAM_BOT_TOKEN:
         log.info("Telegram bot active — listening for admin commands.")
+        register_telegram_commands()
 
     while True:
         check_telegram(clients)
