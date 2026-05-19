@@ -5,8 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/morgan/src/internet-blocker-for-kids
-ExecStart=/home/morgan/.local/bin/uv run internet_blocker.py
+WorkingDirectory=%h/src/internet-blocker-for-kids
+ExecStart=%h/.local/bin/uv run internet_blocker.py
 Restart=on-failure
 RestartSec=30
 
