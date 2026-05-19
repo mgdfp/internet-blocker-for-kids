@@ -390,12 +390,9 @@ def handle_callback_query(callback_query_id: str, data: str, clients: dict) -> N
         answer_callback(callback_query_id)
         cfg = clients[name]
         state = _load_state_raw()
-        throttled = state.get(name, {}).get("throttled", False)
         limit_str = f"{cfg['limit_seconds'] // 60}min" if cfg["limit_seconds"] else "ubegrenset"
-        block_label = "✅ Frigjør" if throttled else "🚫 Blokker"
         keyboard = [
-            [{"text": "✏️ Endre kvote", "callback_data": f"action:{name}:quota"}],
-            [{"text": block_label,        "callback_data": f"action:{name}:block"}],
+            [{"text": "✏️ Endre kvote",      "callback_data": f"action:{name}:quota"}],
             [{"text": "🔄 Nullstill teller", "callback_data": f"action:{name}:reset"}],
         ]
         send_telegram_buttons(f"{name} — kvote: {limit_str}\nHva vil du gjøre?", keyboard)
@@ -412,21 +409,6 @@ def handle_callback_query(callback_query_id: str, data: str, clients: dict) -> N
             answer_callback(callback_query_id)
             _conversation = {"step": "awaiting_quota_minutes", "target": name}
             send_telegram(f"Ny daglig kvote for {name}?\nSkriv antall minutter eller 'unlimited':")
-
-        elif action == "block":
-            throttled = state.get(name, {}).get("throttled", False)
-            if throttled:
-                unthrottle_client(mac)
-                state.setdefault(name, {})["throttled"] = False
-                save_state(state)
-                answer_callback(callback_query_id, "✅ Frigjort!")
-                send_telegram(f"✅ {name} er frigjort.")
-            else:
-                throttle_client(mac)
-                state.setdefault(name, {})["throttled"] = True
-                save_state(state)
-                answer_callback(callback_query_id, "🚫 Blokkert!")
-                send_telegram(f"🚫 {name} er blokkert.")
 
         elif action == "reset":
             unthrottle_client(mac)
