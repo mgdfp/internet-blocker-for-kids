@@ -23,31 +23,19 @@ UDM_IP = os.getenv("UDM_IP")
 API_KEY = os.getenv("UNIFI_API_KEY")
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "300"))
 VLAN_ID = int(os.getenv("VLAN_ID", "0")) or None
-
-# UniFi usergroup _id for the throttled WiFi Speed Limit profile.
-# Find it by running: uv run internet_blocker.py --dump <mac>
-# and reading the "usergroup_id" field after applying the profile in the UI.
 THROTTLE_PROFILE_ID = os.getenv("THROTTLE_PROFILE_ID", "")
-
-# Name of the VLAN4 WiFi network in UniFi (used to update the MAC allowlist).
 WLAN_NAME = os.getenv("WLAN_NAME", "")
-
-# Twilio credentials for SMS notifications to kids.
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
 TWILIO_FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER", "")
-
-# Telegram bot for admin commands from Morgan.
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")  # Morgan's personal chat ID
-
-# Minimum rx_rate in bytes/sec to count as active use (default: 50 Kbps = 6250 bytes/sec).
-# Increase this if idle background sync is triggering false counts.
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 ACTIVE_RATE_THRESHOLD_BYTES_PER_SEC = 6_250
 
 STATE_FILE = Path(__file__).parent / "data" / "state.json"
 MESSAGES_FILE = Path(__file__).parent / "messages.json"
 DYNAMIC_CLIENTS_FILE = Path(__file__).parent / "data" / "dynamic_clients.json"
+SETTINGS_FILE = Path(__file__).parent / "data" / "settings.json"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -57,20 +45,16 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 _telegram_offset = 0
-_conversation: dict = {"step": None}  # tracks multi-step /add flow per session
+_conversation: dict = {"step": None}
+_debug_mode = False
 
 
 # ---------------------------------------------------------------------------
 # Client loading
 # ---------------------------------------------------------------------------
 
-def load_clients() -> dict[str, dict]:
-    """
-    Parse CLIENT* entries from .env. Format per line:
-        CLIENT1=name,mac,60min,+4712345678
-        CLIENT2=name,mac,unlimited
-    Phone number is optional — omit for clients who should not receive SMS.
-    """
+def load_clients() -> dict:
+    """Parse CLIENT* entries from .env. MACs can be pipe-separated for multi-device."""
     clients = {}
     for key in sorted(k for k in os.environ if k.startswith("CLIENT")):
         raw = os.environ[key]
@@ -78,26 +62,28 @@ def load_clients() -> dict[str, dict]:
         if len(parts) not in (3, 4):
             log.warning("Skipping malformed %s (expected name,mac,limit[,phone]): %s", key, raw)
             continue
-        name, mac, quota = parts[0], parts[1], parts[2]
+        name, macs_str, quota = parts[0], parts[1], parts[2]
         phone = parts[3] if len(parts) == 4 else None
-        if quota.lower() == "unlimited":
-            limit_seconds = None
-        else:
-            try:
-                limit_seconds = int(quota.lower().replace("min", "")) * 60
-            except ValueError:
-                log.warning("Skipping %s — invalid limit %r (use e.g. 60min or unlimited)", key, quota)
-                continue
-        clients[name] = {"mac": mac.lower(), "limit_seconds": limit_seconds, "phone": phone}
+        macs = [m.strip().lower() for m in macs_str.split("|")]
+        try:
+            limit_seconds = None if quota.lower() == "unlimited" else int(quota.lower().replace("min", "")) * 60
+        except ValueError:
+            log.warning("Skipping %s — invalid limit %r (use e.g. 60min or unlimited)", key, quota)
+            continue
+        clients[name] = {"macs": macs, "limit_seconds": limit_seconds, "phone": phone}
     return clients
 
 
 def load_dynamic_clients() -> dict:
-    """Load clients added at runtime via Telegram /add command."""
+    """Load clients added at runtime via Telegram /add. Migrates old single-mac format."""
     if DYNAMIC_CLIENTS_FILE.exists():
         try:
             with open(DYNAMIC_CLIENTS_FILE) as f:
-                return json.load(f)
+                data = json.load(f)
+            for cfg in data.values():
+                if "mac" in cfg and "macs" not in cfg:
+                    cfg["macs"] = [cfg.pop("mac")]
+            return data
         except (json.JSONDecodeError, OSError):
             log.warning("Could not read dynamic_clients.json — starting with empty dynamic list.")
     return {}
@@ -117,6 +103,23 @@ def load_messages() -> dict:
     except (FileNotFoundError, json.JSONDecodeError) as e:
         log.warning("Could not load messages.json: %s — SMS will use fallback text.", e)
         return {}
+
+
+def load_settings() -> dict:
+    if SETTINGS_FILE.exists():
+        try:
+            with open(SETTINGS_FILE) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {"debug": False}
+
+
+def save_settings(settings: dict) -> None:
+    tmp = SETTINGS_FILE.with_suffix(".tmp")
+    with open(tmp, "w") as f:
+        json.dump(settings, f, indent=2)
+    os.replace(tmp, SETTINGS_FILE)
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +144,16 @@ def load_state(clients: dict) -> dict:
     return {name: {"seconds": 0, "throttled": False, "notified_half": False} for name in clients}
 
 
+def _load_state_raw() -> dict:
+    if not STATE_FILE.exists():
+        return {}
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
 def save_state(state: dict) -> None:
     tmp = STATE_FILE.with_suffix(".tmp")
     with open(tmp, "w") as f:
@@ -156,7 +169,7 @@ def _headers() -> dict:
     return {"X-API-Key": API_KEY}
 
 
-def fetch_active_clients() -> dict[str, dict] | None:
+def fetch_active_clients() -> dict | None:
     """Returns mac -> client data dict, or None on API error."""
     url = f"https://{UDM_IP}/proxy/network/api/s/default/stat/sta"
     try:
@@ -215,7 +228,6 @@ def _apply_and_reconnect(mac: str, profile_label: str) -> None:
     log.info("[%s] Sending kick-sta to force reconnection.", mac)
     _stamgr("kick-sta", mac)
 
-    # Wait for device to disappear (confirms kick worked)
     deadline = time.time() + 15
     while time.time() < deadline:
         time.sleep(1)
@@ -226,7 +238,6 @@ def _apply_and_reconnect(mac: str, profile_label: str) -> None:
     else:
         log.warning("[%s] Device still visible 15s after kick.", mac)
 
-    # Watch for reconnection
     deadline = time.time() + 30
     while time.time() < deadline:
         time.sleep(1)
@@ -345,6 +356,11 @@ def answer_callback(callback_query_id: str, text: str = "") -> None:
         log.error("Failed to answer callback: %s", e)
 
 
+def send_debug(text: str) -> None:
+    if _debug_mode:
+        send_telegram(text)
+
+
 def _pick_message(messages: dict, event: str, **kwargs) -> str:
     options = messages.get(event, [])
     if not options:
@@ -367,17 +383,8 @@ def _valid_mac(mac: str) -> bool:
     return bool(re.match(r"^([0-9a-f]{2}:){5}[0-9a-f]{2}$", mac.lower()))
 
 
-def _do_add(name: str, mac: str, limit_seconds: int | None, phone: str | None,
-            clients: dict) -> None:
-    """Persist and activate a new client. Removes from unknown devices if present."""
-    new_client = {"mac": mac, "limit_seconds": limit_seconds, "phone": phone}
-    clients[name] = new_client
-    dynamic = load_dynamic_clients()
-    dynamic[name] = new_client
-    save_dynamic_clients(dynamic)
-
-    # If this MAC was in the unknown devices list, remove it and unthrottle —
-    # it'll be tracked properly with its quota from now on.
+def _remove_from_unknown(mac: str) -> None:
+    """Remove a MAC from unknown devices and unthrottle it."""
     if STATE_FILE.exists():
         try:
             with open(STATE_FILE) as f:
@@ -389,55 +396,82 @@ def _do_add(name: str, mac: str, limit_seconds: int | None, phone: str | None,
         except (json.JSONDecodeError, OSError):
             pass
 
-    add_to_wlan_allowlist(mac)
 
+def _do_add(name: str, mac: str, limit_seconds: int | None, phone: str | None,
+            clients: dict) -> None:
+    """Create a new person with a single MAC."""
+    new_client = {"macs": [mac], "limit_seconds": limit_seconds, "phone": phone}
+    clients[name] = new_client
+    dynamic = load_dynamic_clients()
+    dynamic[name] = new_client
+    save_dynamic_clients(dynamic)
+    _remove_from_unknown(mac)
+    add_to_wlan_allowlist(mac)
     limit_str = f"{limit_seconds // 60}min" if limit_seconds else "ubegrenset"
     sms_str = f"SMS til {phone}" if phone else "ingen SMS"
     send_telegram(
         f"✅ {name} er lagt til!\n"
-        f"• MAC: {mac}\n"
         f"• Grense: {limit_str}\n"
         f"• {sms_str}"
     )
     log.info("Added %s (%s) via Telegram.", name, mac)
 
 
-def _load_state_raw() -> dict:
-    if not STATE_FILE.exists():
-        return {}
-    try:
-        with open(STATE_FILE) as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return {}
+def _do_add_mac(name: str, mac: str, clients: dict) -> None:
+    """Add an extra MAC to an existing person."""
+    clients[name]["macs"].append(mac)
+    dynamic = load_dynamic_clients()
+    entry = dynamic.get(name) or dict(clients[name])
+    entry["macs"] = clients[name]["macs"]
+    dynamic[name] = entry
+    save_dynamic_clients(dynamic)
+    _remove_from_unknown(mac)
+    add_to_wlan_allowlist(mac)
+    send_telegram(f"✅ Ny enhet ({mac}) lagt til for {name}.")
+    log.info("Added extra MAC %s to %s via Telegram.", mac, name)
 
 
 def handle_callback_query(callback_query_id: str, data: str, clients: dict) -> None:
     global _conversation
     parts = data.split(":")
 
-    if parts[0] == "modify" and len(parts) == 2:
+    if parts[0] == "add_person" and len(parts) == 2:
+        name = parts[1]
+        if name not in clients:
+            answer_callback(callback_query_id, "Klient ikke funnet.")
+            return
+        answer_callback(callback_query_id)
+        _conversation = {"step": "awaiting_add_mac", "target": name}
+        send_telegram(f"MAC-adresse til {name}s nye enhet?\n(format: aa:bb:cc:dd:ee:ff)")
+
+    elif parts[0] == "add_new":
+        answer_callback(callback_query_id)
+        _conversation = {"step": "awaiting_name"}
+        send_telegram("Hva skal personen hete? (f.eks. dag_kone, ingen mellomrom)")
+
+    elif parts[0] == "modify" and len(parts) == 2:
         name = parts[1]
         if name not in clients:
             answer_callback(callback_query_id, "Klient ikke funnet.")
             return
         answer_callback(callback_query_id)
         cfg = clients[name]
-        state = _load_state_raw()
         limit_str = f"{cfg['limit_seconds'] // 60}min" if cfg["limit_seconds"] else "ubegrenset"
+        n = len(cfg["macs"])
+        device_str = f"{n} enhet{'er' if n > 1 else ''}"
         keyboard = [
             [{"text": "✏️ Endre kvote",      "callback_data": f"action:{name}:quota"}],
             [{"text": "🚫 Blokker",          "callback_data": f"action:{name}:block"}],
             [{"text": "🔄 Nullstill teller", "callback_data": f"action:{name}:reset"}],
         ]
-        send_telegram_buttons(f"{name} — kvote: {limit_str}\nHva vil du gjøre?", keyboard)
+        send_telegram_buttons(f"{name} — {device_str} — kvote: {limit_str}\nHva vil du gjøre?", keyboard)
 
     elif parts[0] == "action" and len(parts) == 3:
         name, action = parts[1], parts[2]
         if name not in clients:
             answer_callback(callback_query_id, "Klient ikke funnet.")
             return
-        mac = clients[name]["mac"]
+        macs = clients[name]["macs"]
         state = _load_state_raw()
 
         if action == "quota":
@@ -446,7 +480,8 @@ def handle_callback_query(callback_query_id: str, data: str, clients: dict) -> N
             send_telegram(f"Ny daglig kvote for {name}?\nSkriv antall minutter eller 'unlimited':")
 
         elif action == "block":
-            throttle_client(mac)
+            for mac in macs:
+                throttle_client(mac)
             state.setdefault(name, {})["throttled"] = True
             save_state(state)
             answer_callback(callback_query_id, "🚫 Blokkert!")
@@ -454,7 +489,8 @@ def handle_callback_query(callback_query_id: str, data: str, clients: dict) -> N
             log.info("%s manually throttled via Telegram.", name)
 
         elif action == "reset":
-            unthrottle_client(mac)
+            for mac in macs:
+                unthrottle_client(mac)
             state[name] = {"seconds": 0, "throttled": False, "notified_half": False}
             save_state(state)
             answer_callback(callback_query_id, "🔄 Nullstilt!")
@@ -463,11 +499,10 @@ def handle_callback_query(callback_query_id: str, data: str, clients: dict) -> N
 
 
 def handle_telegram_command(text: str, clients: dict) -> None:
-    global _conversation
+    global _conversation, _debug_mode
     text = text.strip()
     cmd = text.lower().split()[0] if text else ""
 
-    # Cancel works at any point
     if cmd == "/cancel":
         _conversation = {"step": None}
         send_telegram("❌ Avbrutt.")
@@ -475,17 +510,24 @@ def handle_telegram_command(text: str, clients: dict) -> None:
 
     step = _conversation.get("step")
 
-    # --- No active conversation: expect a command ---
     if step is None:
         if cmd == "/add":
-            _conversation = {"step": "awaiting_name"}
-            send_telegram("Hva skal personen hete? (f.eks. dag_kone, ingen mellomrom)")
+            if clients:
+                keyboard = [[{"text": name, "callback_data": f"add_person:{name}"}]
+                            for name in clients]
+                keyboard.append([{"text": "➕ Ny person", "callback_data": "add_new"}])
+                send_telegram_buttons("Legg til enhet for hvem?", keyboard)
+            else:
+                _conversation = {"step": "awaiting_name"}
+                send_telegram("Hva skal personen hete? (f.eks. dag_kone, ingen mellomrom)")
+
         elif cmd == "/modify":
             if not clients:
                 send_telegram("Ingen klienter å endre.")
                 return
             keyboard = [[{"text": name, "callback_data": f"modify:{name}"}] for name in clients]
             send_telegram_buttons("Velg person å endre:", keyboard)
+
         elif cmd == "/list":
             lines = []
             if clients:
@@ -496,6 +538,8 @@ def handle_telegram_command(text: str, clients: dict) -> None:
                     limit_str = f"{cfg['limit_seconds'] // 60}min" if cfg["limit_seconds"] else "ubegrenset"
                     source = "(lagt til)" if name in dynamic_names else "(.env)"
                     phone_str = cfg["phone"] if cfg.get("phone") else "ingen SMS"
+                    n = len(cfg["macs"])
+                    device_str = f"{n} enhet{'er' if n > 1 else ''}"
                     person = state.get(name, {})
                     used_min = person.get("seconds", 0) // 60
                     throttled = person.get("throttled", False)
@@ -503,12 +547,12 @@ def handle_telegram_command(text: str, clients: dict) -> None:
                         status = f"🚫 {used_min}min brukt" if throttled else f"{used_min}/{cfg['limit_seconds'] // 60}min"
                     else:
                         status = f"{used_min}min brukt (ubegrenset)"
-                    lines.append(f"• {name} — {status} — {phone_str} {source}")
+                    lines.append(f"• {name} — {status} — {device_str} — {phone_str} {source}")
             if STATE_FILE.exists():
                 try:
                     with open(STATE_FILE) as f:
-                        state = json.load(f)
-                    unknowns = state.get("unknown_devices", {})
+                        st = json.load(f)
+                    unknowns = st.get("unknown_devices", {})
                     if unknowns:
                         lines.append("\n⚠️ Ukjente enheter (begrenset hastighet):\n")
                         for mac, info in unknowns.items():
@@ -519,8 +563,32 @@ def handle_telegram_command(text: str, clients: dict) -> None:
                 send_telegram("Ingen klienter konfigurert.")
                 return
             send_telegram("\n".join(lines))
+
+        elif cmd == "/debug":
+            _debug_mode = True
+            settings = load_settings()
+            settings["debug"] = True
+            save_settings(settings)
+            send_telegram("🔍 Debug-modus aktivert. Du får nå varsler ved blokkering og hvert 10. minutt.")
+            log.info("Debug mode enabled via Telegram.")
+
+        elif cmd == "/info":
+            _debug_mode = False
+            settings = load_settings()
+            settings["debug"] = False
+            save_settings(settings)
+            send_telegram("ℹ️ Normal modus gjenopprettet.")
+            log.info("Debug mode disabled via Telegram.")
+
         else:
-            send_telegram("Tilgjengelige kommandoer:\n/add — legg til ny person\n/modify — endre kvote/blokker/nullstill\n/list — vis alle")
+            send_telegram(
+                "Tilgjengelige kommandoer:\n"
+                "/add — legg til enhet\n"
+                "/modify — endre kvote/blokker/nullstill\n"
+                "/list — vis alle\n"
+                "/debug — aktiver debug-varsler\n"
+                "/info — deaktiver debug-varsler"
+            )
         return
 
     # --- Active conversation steps ---
@@ -558,6 +626,17 @@ def handle_telegram_command(text: str, clients: dict) -> None:
             phone=phone,
             clients=clients,
         )
+        _conversation = {"step": None}
+
+    elif step == "awaiting_add_mac":
+        if not _valid_mac(text):
+            send_telegram("❌ Ugyldig MAC-adresse. Format: aa:bb:cc:dd:ee:ff\nPrøv igjen:")
+            return
+        target = _conversation.get("target")
+        if target and target in clients:
+            _do_add_mac(target, text.lower(), clients)
+        else:
+            send_telegram("❌ Klient ikke funnet.")
         _conversation = {"step": None}
 
     elif step == "awaiting_quota_minutes":
@@ -626,19 +705,19 @@ def run_reset(clients: dict) -> None:
     log.info("Running daily reset — unblocking and removing rate limits for all clients.")
     state = load_state(clients)
     for name, cfg in clients.items():
-        mac = cfg["mac"]
-        _stamgr("unblock-sta", mac)
-        if unthrottle_client(mac):
-            log.info("Unthrottled %s (%s).", name, mac)
+        for mac in cfg["macs"]:
+            _stamgr("unblock-sta", mac)
+            if unthrottle_client(mac):
+                log.info("Unthrottled %s (%s).", name, mac)
     fresh = {name: {"seconds": 0, "throttled": False, "notified_half": False} for name in clients}
     fresh["last_reset_date"] = date.today().isoformat()
-    fresh["unknown_devices"] = state.get("unknown_devices", {})  # unknown stay throttled
+    fresh["unknown_devices"] = state.get("unknown_devices", {})
     save_state(fresh)
     log.info("Reset complete.")
 
 
 def handle_unknown_devices(active_network_clients: dict, clients: dict, state: dict) -> None:
-    known_macs = {cfg["mac"].lower() for cfg in clients.values()}
+    known_macs = {mac for cfg in clients.values() for mac in cfg["macs"]}
     unknown_devices = state.setdefault("unknown_devices", {})
 
     for mac, client in active_network_clients.items():
@@ -650,11 +729,12 @@ def handle_unknown_devices(active_network_clients: dict, clients: dict, state: d
             throttle_client(mac)
             unknown_devices[mac] = {"hostname": hostname, "first_seen": date.today().isoformat()}
             if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-                msg = (f"Unknown device on network:\n"
-                       f"  MAC: `{mac}`\n"
-                       f"  Name: {hostname}\n\n"
-                       f"Use /add to register it.")
-                send_telegram(msg)
+                send_telegram(
+                    f"Ukjent enhet på nettverket:\n"
+                    f"  MAC: {mac}\n"
+                    f"  Navn: {hostname}\n\n"
+                    f"Bruk /add for å registrere den."
+                )
         else:
             throttle_client(mac)
 
@@ -673,7 +753,7 @@ def run_monitor(clients: dict, messages: dict) -> None:
     handle_unknown_devices(active_network_clients, clients, state)
 
     for name, cfg in clients.items():
-        mac = cfg["mac"]
+        macs = cfg["macs"]
         limit_seconds = cfg["limit_seconds"]
         phone = cfg["phone"]
         person = state.setdefault(name, {"seconds": 0, "throttled": False, "notified_half": False})
@@ -682,40 +762,75 @@ def run_monitor(clients: dict, messages: dict) -> None:
             log.info("%s already throttled, skipping.", name)
             continue
 
-        client = active_network_clients.get(mac)
-        if client is None:
+        # Migrate tx_bytes from old scalar format to per-MAC dict
+        if isinstance(person.get("tx_bytes"), (int, float)):
+            person["tx_bytes"] = {}
+        tx_bytes_map = person.setdefault("tx_bytes", {})
+
+        total_delta = 0
+        idle_rates = []
+        active_mac_count = 0
+        any_on_network = False
+        waiting_for_baseline = False
+
+        for mac in macs:
+            client = active_network_clients.get(mac)
+            if client is None:
+                tx_bytes_map.pop(mac, None)
+                continue
+
+            any_on_network = True
+            tx_bytes = client.get("tx_bytes") or 0
+            prev = tx_bytes_map.get(mac)
+            tx_bytes_map[mac] = tx_bytes
+
+            if prev is None:
+                waiting_for_baseline = True
+                continue
+
+            delta = tx_bytes - prev
+            if delta < 0:
+                log.info("%s (%s) tx_bytes counter reset, skipping interval.", name, mac)
+                continue
+
+            avg_rate = delta / POLL_INTERVAL_SECONDS
+            if avg_rate >= ACTIVE_RATE_THRESHOLD_BYTES_PER_SEC:
+                total_delta += delta
+                active_mac_count += 1
+            else:
+                idle_rates.append(avg_rate)
+
+        if not any_on_network:
             log.info("%s not on network.", name)
-            person.pop("tx_bytes", None)
             continue
 
-        tx_bytes = client.get("tx_bytes") or 0
-        prev_tx_bytes = person.get("tx_bytes")
-        person["tx_bytes"] = tx_bytes
-
-        if prev_tx_bytes is None:
-            log.info("%s first seen this session — waiting for next poll to measure usage.", name)
+        if waiting_for_baseline and active_mac_count == 0:
+            log.info("%s first seen — waiting for next poll to measure usage.", name)
             continue
 
-        delta_bytes = tx_bytes - prev_tx_bytes
-        if delta_bytes < 0:
-            # Counter reset (device reconnected) — skip this interval
-            log.info("%s tx_bytes counter reset, skipping interval.", name)
+        if active_mac_count == 0:
+            avg_idle = sum(idle_rates) / len(idle_rates) if idle_rates else 0
+            log.info("%s idle (avg %.0f bytes/s), not counting.", name, avg_idle)
             continue
 
-        avg_rate = delta_bytes / POLL_INTERVAL_SECONDS
-        if avg_rate < ACTIVE_RATE_THRESHOLD_BYTES_PER_SEC:
-            log.info("%s idle (avg %.0f bytes/s over last %ds), not counting.", name, avg_rate, POLL_INTERVAL_SECONDS)
-            continue
-
+        # At least one device is active — count one poll interval
         person["seconds"] += POLL_INTERVAL_SECONDS
         minutes_used = person["seconds"] // 60
+        total_avg_rate = total_delta / POLL_INTERVAL_SECONDS
 
         if limit_seconds is None:
-            log.info("%s active — %dm used (unlimited) [avg dl %.0f bytes/s].", name, minutes_used, avg_rate)
+            log.info("%s active — %dm used (unlimited) [avg dl %.0f bytes/s].", name, minutes_used, total_avg_rate)
             continue
 
         limit_minutes = limit_seconds // 60
-        log.info("%s active — %dm/%dm used [avg dl %.0f bytes/s].", name, minutes_used, limit_minutes, avg_rate)
+        log.info("%s active — %dm/%dm used [avg dl %.0f bytes/s].", name, minutes_used, limit_minutes, total_avg_rate)
+
+        # Debug: 10-minute milestones
+        last_milestone = person.get("last_10min_milestone", 0)
+        current_milestone = (minutes_used // 10) * 10
+        if current_milestone > last_milestone and current_milestone > 0:
+            person["last_10min_milestone"] = current_milestone
+            send_debug(f"⏱ {name}: {minutes_used}/{limit_minutes}min brukt")
 
         # 50% notification
         if not person.get("notified_half") and person["seconds"] >= limit_seconds // 2:
@@ -728,10 +843,14 @@ def run_monitor(clients: dict, messages: dict) -> None:
                 log.info("50%% notification sent to %s.", name)
             person["notified_half"] = True
 
-        # Throttle
+        # Throttle all devices when quota is reached
         if person["seconds"] >= limit_seconds:
-            log.info("Limit reached — applying throttle profile to %s.", name)
-            if throttle_client(mac):
+            log.info("Limit reached — throttling all devices for %s.", name)
+            throttled_any = False
+            for mac in macs:
+                if throttle_client(mac):
+                    throttled_any = True
+            if throttled_any:
                 person["throttled"] = True
                 msg = _pick_message(messages, "throttled",
                                     name=name.capitalize(), used=minutes_used,
@@ -739,6 +858,7 @@ def run_monitor(clients: dict, messages: dict) -> None:
                 if msg:
                     send_sms(phone, msg)
                     log.info("Throttle notification sent to %s.", name)
+                send_debug(f"🚫 {name} er blokkert etter {minutes_used}min.")
 
     save_state(state)
 
@@ -748,14 +868,21 @@ def run_monitor(clients: dict, messages: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    global _debug_mode
+
     if not UDM_IP or not API_KEY:
         log.error("UDM_IP and UNIFI_API_KEY must be set in .env")
         sys.exit(1)
 
+    STATE_FILE.parent.mkdir(exist_ok=True)
+
+    settings = load_settings()
+    _debug_mode = settings.get("debug", False)
+
     clients = load_clients()
     clients.update(load_dynamic_clients())
     if not clients:
-        log.error("No CLIENT* entries found in .env. See .env.example for format.")
+        log.error("No clients configured. Add clients via Telegram /add or CLIENT* entries in .env.")
         sys.exit(1)
 
     parser = argparse.ArgumentParser()
@@ -784,11 +911,12 @@ def main() -> None:
 
     messages = load_messages()
 
-    log.info("Starting internet blocker.")
+    log.info("Starting internet blocker. Debug mode: %s.", "ON" if _debug_mode else "off")
     for name, cfg in clients.items():
         limit_str = f"{cfg['limit_seconds'] // 60}min" if cfg["limit_seconds"] else "unlimited"
         sms_str = cfg["phone"] if cfg["phone"] else "no SMS"
-        log.info("  %s — %s — limit: %s — %s", name, cfg["mac"], limit_str, sms_str)
+        macs_str = ", ".join(cfg["macs"])
+        log.info("  %s — %s — limit: %s — %s", name, macs_str, limit_str, sms_str)
     vlan_str = f"VLAN{VLAN_ID}" if VLAN_ID else "all VLANs"
     log.info("Polling %s every %ds | Throttle profile: %s | Active threshold: %d bytes/s",
              vlan_str, POLL_INTERVAL_SECONDS, THROTTLE_PROFILE_ID or "NOT SET",
@@ -797,7 +925,7 @@ def main() -> None:
         log.info("Telegram bot active — listening for admin commands.")
 
     while True:
-        check_telegram(clients)  # long-polls for up to POLL_INTERVAL_SECONDS-5s
+        check_telegram(clients)
 
         state = load_state(clients)
         if state.get("last_reset_date") != date.today().isoformat():
